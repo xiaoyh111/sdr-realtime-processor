@@ -13,8 +13,8 @@ function sdr_realtime_processor()
     state.source_data_len  = 0;
     state.source_read_pos  = 0;
     state.source_fs        = 2.4e6;
-    state.source_fc        = 100e6;
-    state.source_gain      = 20;
+    state.source_fc        = 96.5e6;
+    state.source_gain      = 40;
     state.source_handle    = [];      % RTL-SDR 对象句柄
     state.source_file_info = '';
     % --- 处理参数 ---
@@ -32,6 +32,10 @@ function sdr_realtime_processor()
     state.cs_b_fm          = [];
     state.cs_b_am          = [];
     state.cs_zi            = [];
+    % --- DDC混频表缓存 (避免每帧重算exp) ---
+    state.ddc_table        = [];
+    state.ddc_table_offset = nan;
+    state.ddc_table_N      = 0;
     % --- AM解调状态 ---
     state.am_dc_alpha      = 0.999;
     state.am_dc_est        = 0;
@@ -161,7 +165,7 @@ function sdr_realtime_processor()
     fc_row.Padding = [2, 0, 2, 0];
     uilabel(fc_row, 'Text', '中心频率:');
     state.edit_fc = uieditfield(fc_row, 'numeric', ...
-        'Value', 100, 'ValueDisplayFormat', '%.3f MHz', ...
+        'Value', 96.5, 'ValueDisplayFormat', '%.3f MHz', ...
         'Tooltip', 'RTL-SDR接收中心频率 / 记录时的SDR#中心频率');
 
     % RF增益 (仅RTL-SDR模式可见)
@@ -171,7 +175,7 @@ function sdr_realtime_processor()
     state.gain_row = gain_row;  % 保存句柄以控制可见性
     uilabel(gain_row, 'Text', 'RF增益:');
     state.edit_gain = uieditfield(gain_row, 'numeric', ...
-        'Value', 20, 'ValueDisplayFormat', '%.0f dB', ...
+        'Value', 40, 'ValueDisplayFormat', '%.0f dB', ...
         'Tooltip', 'RTL-SDR射频增益 (0~49.6 dB)');
     gain_row.Visible = 'off';  % 默认隐藏 (文件回放模式)
 
@@ -478,7 +482,7 @@ function sdr_realtime_processor()
         % 自动切换到该模式的经典频率
         if ~strcmp(state.mode, prev_mode)
             if strcmp(state.mode, 'FM')
-                state.edit_fc.Value = 100;          % FM广播: 100 MHz
+                state.edit_fc.Value = 96.5;          % FM广播: 96.5 MHz
             else
                 state.edit_fc.Value = 1;            % AM广播: 1 MHz (1000 kHz)
             end
@@ -714,8 +718,16 @@ function sdr_realtime_processor()
                     else
                         cs_b = state.cs_b_fm;
                     end
+                    % DDC混频表缓存: f_offset未变则复用, 避免每帧重算exp
+                    N_iq = length(iq_frame);
+                    if isempty(state.ddc_table) || state.f_offset ~= state.ddc_table_offset || N_iq ~= state.ddc_table_N
+                        t = (0:N_iq-1)' / state.source_fs;
+                        state.ddc_table = exp(-1j * 2 * pi * state.f_offset * t);
+                        state.ddc_table_offset = state.f_offset;
+                        state.ddc_table_N = N_iq;
+                    end
                     [iq_sel, state.cs_zi] = channel_select_stream(...
-                        iq_frame, state.source_fs, state.f_offset, cs_b, state.cs_zi);
+                        iq_frame, state.ddc_table, cs_b, state.cs_zi);
                 else
                     iq_sel = iq_frame;
                 end
@@ -959,7 +971,7 @@ function sdr_realtime_processor()
     % ---- RTL-SDR 硬件数据源 ----
     function success = open_rtlsdr_source()
         try
-            % RTL-SDR要求SamplesPerFrame ≤ 32768
+            % RTL-SDR要求SamplesPerFrame ≤ 32768, 大帧通过多次读取拼接
             rtl_frame = min(state.frame_size, 32768);
             state.source_handle = comm.SDRRTLReceiver('0', ...
                 'CenterFrequency',     state.source_fc, ...
@@ -984,18 +996,25 @@ function sdr_realtime_processor()
     end
 
     function [iq_frame, done] = read_rtlsdr_frame()
-        % RTL-SDR 是连续流，永不结束
-        % done 仅在手動停止或硬件拔出时为 true
+        % RTL-SDR 连续流, 永不结束. 硬件每次最多32768, 大帧多次读取拼接
+        rtl_frame = min(state.frame_size, 32768);
+        n_chunks = ceil(state.frame_size / rtl_frame);
+        iq_frame = zeros(state.frame_size, 1);
         try
-            [iq_frame, ~] = state.source_handle();
-            iq_frame = iq_frame(:);
+            for c = 1:n_chunks
+                chunk = state.source_handle();
+                chunk = chunk(:);
+                i0 = (c - 1) * rtl_frame + 1;
+                i1 = min(i0 + rtl_frame - 1, state.frame_size);
+                n_take = i1 - i0 + 1;
+                iq_frame(i0:i1) = chunk(1:n_take);
+            end
             done = false;
         catch ME
-            % 读取失败: 填零继续, 不退出循环
             state.lbl_status.Text = ['RTL-SDR读取错误: ', ME.message];
             state.lbl_status.FontColor = [0.8 0.4 0];
             iq_frame = zeros(state.frame_size, 1);
-            done = false;  % 关键: 不退出循环, 让用户手动停止
+            done = false;
         end
     end
 
@@ -1049,14 +1068,14 @@ function sdr_realtime_processor()
     %% ==================== 滤波器设计 (处理循环开始时调用) ====================
 
     function design_channel_filter()
-        % 为两种模式各设计一个频道选择滤波器
+        % 为两种模式各设计一个频道选择滤波器 (60dB衰减)
         % FM: 120 kHz 带宽
         bw_fm = 120000;
         filt_stop = bw_fm * 1.15;
         try
             lp_filt = designfilt('lowpassfir', ...
                 'PassbandFrequency', bw_fm, 'StopbandFrequency', filt_stop, ...
-                'PassbandRipple', 0.01, 'StopbandAttenuation', 80, ...
+                'PassbandRipple', 0.01, 'StopbandAttenuation', 60, ...
                 'SampleRate', state.source_fs, 'DesignMethod', 'kaiserwin');
             state.cs_b_fm = lp_filt.Coefficients;
         catch
@@ -1070,7 +1089,7 @@ function sdr_realtime_processor()
         try
             lp_filt = designfilt('lowpassfir', ...
                 'PassbandFrequency', bw_am, 'StopbandFrequency', filt_stop, ...
-                'PassbandRipple', 0.01, 'StopbandAttenuation', 80, ...
+                'PassbandRipple', 0.01, 'StopbandAttenuation', 60, ...
                 'SampleRate', state.source_fs, 'DesignMethod', 'kaiserwin');
             state.cs_b_am = lp_filt.Coefficients;
         catch
@@ -1305,21 +1324,17 @@ end  % sdr_realtime_processor 主函数结束
 
 
 %% ==================== 流式频道选择 ====================
-function [iq_out, cs_zi] = channel_select_stream(iq_frame, fs, f_offset, filt_b, cs_zi)
+function [iq_out, cs_zi] = channel_select_stream(iq_frame, ddc_table, filt_b, cs_zi)
 % 流式数字下变频 + 信道滤波 (保持滤波器状态跨帧连续)
 %   iq_frame  - 输入IQ帧 (N×1 complex)
-%   fs        - 采样率 (Hz)
-%   f_offset  - 目标信号频率偏移 (Hz)
+%   ddc_table - 预计算的DDC混频表 exp(-1j*2*pi*f_offset*t), 调用方缓存避免每帧重算
 %   filt_b    - FIR低通滤波器系数
 %   cs_zi     - 滤波器延迟线状态 ([] = 初始化)
 %   iq_out    - 频道选择后的IQ信号
 %   cs_zi     - 更新后的滤波器状态
 
-    N = length(iq_frame);
-    t = (0:N-1)' / fs;
-
-    % DDC: 将目标信号搬移到DC
-    iq_shifted = iq_frame .* exp(-1j * 2 * pi * f_offset * t);
+    % DDC: 将目标信号搬移到DC (使用预计算混频表)
+    iq_shifted = iq_frame .* ddc_table;
 
     % LPF + 状态连续性
     [iq_out, cs_zi] = filter(filt_b, 1, iq_shifted, cs_zi);
@@ -1456,7 +1471,7 @@ function [y, stages] = multistage_decimate_stream(x, fs_in, fs_out, lp_cutoff, s
                     'PassbandFrequency', filt_cutoff, ...
                     'StopbandFrequency', filt_stop, ...
                     'PassbandRipple', 0.01, ...
-                    'StopbandAttenuation', 80, ...
+                    'StopbandAttenuation', 60, ...
                     'SampleRate', fs_current, ...
                     'DesignMethod', 'kaiserwin');
                 b = fir_filt.Coefficients;
