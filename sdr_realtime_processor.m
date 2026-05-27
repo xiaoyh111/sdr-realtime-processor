@@ -1,7 +1,7 @@
 function sdr_realtime_processor()
 % SDR实时信号接收与解调系统
 % 功能: 从IQ基带文件逐帧读取数据, 完成AM/FM信号的实时流式解调
-% 数据源: IQ WAV文件回放 (v1), RTL-SDR/rtl_tcp预留接口
+% 数据源: IQ WAV文件回放 (v1), RTL-SDR硬件
 % 输出: 实时频谱, 瀑布图, 音频波形, 低延迟音频播放
 
     %% ==================== 全局状态 ====================
@@ -15,7 +15,7 @@ function sdr_realtime_processor()
     state.source_fs        = 2.4e6;
     state.source_fc        = 100e6;
     state.source_gain      = 20;
-    state.source_handle    = [];      % RTL-SDR/rtl_tcp 对象句柄
+    state.source_handle    = [];      % RTL-SDR 对象句柄
     state.source_file_info = '';
     % --- 处理参数 ---
     state.running          = false;
@@ -129,7 +129,7 @@ function sdr_realtime_processor()
             'FontWeight', 'bold', 'HorizontalAlignment', 'center');
 
     state.dd_source = uidropdown(ctrl_grid, ...
-        'Items', {'文件回放', 'RTL-SDR 硬件', 'rtl_tcp (TCP流)'}, ...
+        'Items', {'文件回放', 'RTL-SDR 硬件'}, ...
         'Value', '文件回放', ...
         'ValueChangedFcn', @(src, evt) source_changed_callback());
 
@@ -161,10 +161,10 @@ function sdr_realtime_processor()
     fc_row.Padding = [2, 0, 2, 0];
     uilabel(fc_row, 'Text', '中心频率:');
     state.edit_fc = uieditfield(fc_row, 'numeric', ...
-        'Value', 100, 'ValueDisplayFormat', '%.2f MHz', ...
+        'Value', 100, 'ValueDisplayFormat', '%.3f MHz', ...
         'Tooltip', 'RTL-SDR接收中心频率 / 记录时的SDR#中心频率');
 
-    % RF增益 (仅RTL-SDR/rtl_tcp模式可见)
+    % RF增益 (仅RTL-SDR模式可见)
     gain_row = uigridlayout(ctrl_grid, [1, 2]);
     gain_row.ColumnWidth = {65, '1x'};
     gain_row.Padding = [2, 0, 2, 0];
@@ -395,9 +395,9 @@ function sdr_realtime_processor()
         hold(ax, 'off');
         xlabel(ax, '频率 (kHz)');
         ylabel(ax, '功率谱密度 (dB/Hz)');
-        title(ax, sprintf('频谱预览 (%s, Fc=%.2f MHz)', state.mode, fc/1e6));
+        title(ax, sprintf('频谱预览 (%s, Fc=%.3f MHz)', state.mode, fc/1e6));
         grid(ax, 'on');
-        xlim(ax, [-state.source_fs/2e3, state.source_fs/2e3]);
+        set_spectrum_range(ax);
         state.spectrum_line = [];
 
         % 同步更新瀑布图预览
@@ -425,7 +425,7 @@ function sdr_realtime_processor()
             set(ax_wf, 'Color', [0.02 0.02 0.08]);
             colorbar(ax_wf);
             xlabel(ax_wf, '频率 (kHz)');
-            title(ax_wf, sprintf('瀑布图预览 (Fc=%.2f MHz)', fc/1e6));
+            title(ax_wf, sprintf('瀑布图预览 (Fc=%.3f MHz)', fc/1e6));
         catch
             text(ax_wf, 0.5, 0.5, '瀑布图预览失败', ...
                 'HorizontalAlignment', 'center');
@@ -462,20 +462,11 @@ function sdr_realtime_processor()
                     state.lbl_status.Text = '请先安装 RTL-SDR 支持包: 运行 supportPackageInstaller';
                     state.lbl_status.FontColor = [0.8 0.4 0];
                 end
-            case 'rtl_tcp (TCP流)'
-                state.source_type = 'rtltcp';
-                state.btn_browse.Visible = 'off';
-                state.lbl_file.Visible = 'off';
-                state.cb_loop.Enable = 'off';
-                state.edit_fs.Editable = 'on';
-                state.edit_fs.Value = 2.4;
-                state.gain_row.Visible = 'on';
-                state.lbl_status.Text = 'rtl_tcp: 请先在命令行启动 rtl_tcp -a 127.0.0.1 -p 1234 -f 100e6 -s 2.4e6';
-                state.lbl_status.FontColor = [0.6 0.4 0];
         end
     end
 
     function mode_changed_callback()
+        prev_mode = state.mode;
         if state.rb_fm.Value
             state.mode = 'FM';
         else
@@ -484,6 +475,15 @@ function sdr_realtime_processor()
         state.lbl_mode.Text = ['模式: ', state.mode, '解调'];
         % 模式切换时重置频道选择滤波器状态 (不同模式滤波器阶数不同)
         state.cs_zi = [];
+        % 自动切换到该模式的经典频率
+        if ~strcmp(state.mode, prev_mode)
+            if strcmp(state.mode, 'FM')
+                state.edit_fc.Value = 100;          % FM广播: 100 MHz
+            else
+                state.edit_fc.Value = 1;            % AM广播: 1 MHz (1000 kHz)
+            end
+            state.source_fc = state.edit_fc.Value * 1e6;
+        end
     end
 
     function play_callback()
@@ -552,10 +552,7 @@ function sdr_realtime_processor()
                     return;
                 end
             end
-            if strcmp(state.source_type, 'rtltcp')
-                uialert(fig, 'rtl_tcp模式尚未实现, 请使用"文件回放"或"RTL-SDR 硬件"模式', '提示');
-                return;
-            end
+
 
             % 读取参数
             state.source_fs   = state.edit_fs.Value * 1e6;
@@ -854,8 +851,6 @@ function sdr_realtime_processor()
                 success = open_file_source();
             case 'rtlsdr'
                 success = open_rtlsdr_source();
-            case 'rtltcp'
-                success = open_rtltcp_source();
         end
     end
 
@@ -865,8 +860,6 @@ function sdr_realtime_processor()
                 [iq_frame, done] = read_file_frame();
             case 'rtlsdr'
                 [iq_frame, done] = read_rtlsdr_frame();
-            case 'rtltcp'
-                [iq_frame, done] = read_rtltcp_frame();
         end
     end
 
@@ -876,8 +869,6 @@ function sdr_realtime_processor()
                 close_file_source();
             case 'rtlsdr'
                 close_rtlsdr_source();
-            case 'rtltcp'
-                close_rtltcp_source();
         end
     end
 
@@ -981,7 +972,7 @@ function sdr_realtime_processor()
             actual_fs = state.source_handle.SampleRate;
             state.source_fs = actual_fs;
             state.edit_fs.Value = actual_fs / 1e6;
-            state.lbl_status.Text = sprintf('RTL-SDR已连接 @ %.2f MHz, %.3f MSPS', ...
+            state.lbl_status.Text = sprintf('RTL-SDR已连接 @ %.3f MHz, %.3f MSPS', ...
                 state.source_fc/1e6, actual_fs/1e6);
             state.lbl_status.FontColor = [0 0.6 0];
             success = true;
@@ -1018,22 +1009,6 @@ function sdr_realtime_processor()
         end
     end
 
-    % ---- rtl_tcp TCP数据源 (暂未实现) ----
-    function success = open_rtltcp_source()
-        state.lbl_status.Text = 'rtl_tcp模式尚未实现';
-        state.lbl_status.FontColor = [0.8 0 0];
-        success = false;
-    end
-
-    function [iq_frame, done] = read_rtltcp_frame()
-        iq_frame = zeros(state.frame_size, 1);
-        done = true;
-    end
-
-    function close_rtltcp_source()
-        % no-op
-    end
-
     %% ==================== 运行时参数即时更新 ====================
     function apply_runtime_params()
         % 允许在接收过程中实时调整: 中心频率、增益、解调偏移
@@ -1047,7 +1022,7 @@ function sdr_realtime_processor()
             if strcmp(state.source_type, 'rtlsdr') && ~isempty(state.source_handle)
                 try
                     state.source_handle.CenterFrequency = new_fc;
-                    state.lbl_status.Text = sprintf('已调谐到 %.2f MHz', new_fc/1e6);
+                    state.lbl_status.Text = sprintf('已调谐到 %.3f MHz', new_fc/1e6);
                     state.lbl_status.FontColor = [0 0.6 0];
                 catch
                 end
@@ -1140,7 +1115,7 @@ function sdr_realtime_processor()
             ylabel(ax, '功率 (dB)');
             title(ax, sprintf('实时频谱 (FFT, %s)', state.mode));
             grid(ax, 'on');
-            xlim(ax, [-state.source_fs/2e3, state.source_fs/2e3]);
+            set_spectrum_range(ax);
 
             % 自适应Y轴范围
             p_valid = pxx_db(isfinite(pxx_db));
@@ -1150,6 +1125,7 @@ function sdr_realtime_processor()
             end
         else
             set(state.spectrum_line, 'XData', f_khz, 'YData', pxx_db);
+            set_spectrum_range(ax);
 
             % 缓慢跟踪Y轴范围
             p_valid = pxx_db(isfinite(pxx_db));
@@ -1171,6 +1147,15 @@ function sdr_realtime_processor()
                 plot_signal_annotations(ax, signals);
             catch
             end
+        end
+    end
+
+    function set_spectrum_range(ax)
+        % AM: ±30 kHz 窄带显示, FM: 全Nyquist带宽
+        if strcmp(state.mode, 'AM')
+            xlim(ax, [-30, 30]);
+        else
+            xlim(ax, [-state.source_fs/2e3, state.source_fs/2e3]);
         end
     end
 
@@ -1248,9 +1233,11 @@ function sdr_realtime_processor()
             xlabel(ax, '频率 (kHz)');
             ylabel(ax, '帧序号 (新→旧 ↓)');
             title(ax, '实时瀑布图 (最新在顶部)');
+            set_spectrum_range(ax);
         else
             set(state.waterfall_img, 'CData', ordered);
             caxis(ax, [c_low, c_high]);
+            set_spectrum_range(ax);
         end
     end
 
