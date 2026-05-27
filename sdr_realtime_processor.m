@@ -25,7 +25,9 @@ function sdr_realtime_processor()
     state.audio_fs         = 48000;
     state.loop_playback    = false;
     state.use_audio_toolbox = false;
-    state.audio_accum      = [];
+    state.audio_accum      = [];       % 流式累积 (用于导出)
+    state.audio            = [];       % 最终音频 (处理完成后赋值)
+    state.is_demod         = false;    % 是否有可播放/导出的音频
     % --- 频道选择滤波器 ---
     state.cs_b_fm          = [];
     state.cs_b_am          = [];
@@ -76,6 +78,8 @@ function sdr_realtime_processor()
     state.dd_frame         = [];
     state.cb_loop          = [];
     state.btn_start        = [];
+    state.btn_play         = [];
+    state.btn_export       = [];
     state.txt_status       = [];
     state.ax_spectrum      = [];
     state.ax_waterfall     = [];
@@ -115,8 +119,8 @@ function sdr_realtime_processor()
     ctrl_panel = uipanel(top_grid, 'Title', '实时控制', ...
                          'FontSize', 13, 'FontWeight', 'bold');
 
-    ctrl_grid = uigridlayout(ctrl_panel, [15, 1]);
-    ctrl_grid.RowHeight = {22, 30, 36, 22, 36, 36, 36, 36, 22, 50, 36, 28, 44, 22, '1x'};
+    ctrl_grid = uigridlayout(ctrl_panel, [17, 1]);
+    ctrl_grid.RowHeight = {22, 30, 36, 22, 36, 36, 36, 36, 22, 50, 36, 28, 44, 36, 36, 22, '1x'};
     ctrl_grid.Padding = [8, 8, 8, 8];
     ctrl_grid.RowSpacing = 4;
 
@@ -207,6 +211,16 @@ function sdr_realtime_processor()
         'ButtonPushedFcn', @(src, evt) start_stop_callback(), ...
         'FontWeight', 'bold', 'FontSize', 13, ...
         'BackgroundColor', [0.6 1.0 0.6]);
+
+    state.btn_play = uibutton(ctrl_grid, 'push', ...
+        'Text', '🔊 播放音频', ...
+        'ButtonPushedFcn', @(src, evt) play_callback(), ...
+        'Enable', 'off');
+
+    state.btn_export = uibutton(ctrl_grid, 'push', ...
+        'Text', '💾 导出WAV', ...
+        'ButtonPushedFcn', @(src, evt) export_callback(), ...
+        'Enable', 'off');
 
     % --- 状态文本区 ---
     uilabel(ctrl_grid, 'Text', '━━ 状态 ━━', ...
@@ -334,6 +348,89 @@ function sdr_realtime_processor()
         state.lbl_status.Text = ['文件就绪: ', short_name];
         state.lbl_status.FontColor = [0 0.6 0];
         state.lbl_mode.Text = ['模式: ', state.mode, '解调'];
+
+        % 显示频谱预览 (方便在开始前设置解调偏移)
+        quick_spectrum_preview();
+    end
+
+    function quick_spectrum_preview()
+        % 快速读取文件片段显示频谱, 方便用户设置解调偏移
+        fc = state.edit_fc.Value * 1e6;
+        try
+            n_preview = min(state.source_data_len, round(state.source_fs * 5));
+            data = audioread(state.source_filepath, [1, n_preview], 'native');
+            iq_preview = double(data(:,1)) + 1j*double(data(:,2));
+        catch
+            return;
+        end
+
+        [pxx, f] = pwelch(iq_preview, hann(4096), 2048, 8192, state.source_fs);
+        pxx_db = fftshift(10 * log10(pxx));
+        f_centered = f - state.source_fs/2;
+
+        ax = state.ax_spectrum;
+        cla(ax);
+        plot(ax, f_centered/1e3, pxx_db, 'b-', 'LineWidth', 1.0);
+        hold(ax, 'on');
+
+        % 带宽参考线
+        xline(ax, -100, '--', 'Color', [0.1 0.4 1.0], 'LineWidth', 1.2);
+        xline(ax, +100, '--', 'Color', [0.1 0.4 1.0], 'LineWidth', 1.2);
+
+        % 信号检测标注
+        try
+            signals = detect_signals(f_centered, pxx_db, state.mode);
+            colors = lines(min(length(signals), 7));
+            for k = 1:length(signals)
+                s = signals(k);
+                c = colors(k, :);
+                xline(ax, s.freq/1e3, '-', 'Color', c, 'LineWidth', 1.5);
+                text(ax, s.freq/1e3, s.peak_pwr+2, sprintf('%.1f kHz', s.freq/1e3), ...
+                    'Color', c, 'FontSize', 9, 'FontWeight', 'bold', ...
+                    'HorizontalAlignment', 'center');
+            end
+        catch
+        end
+
+        hold(ax, 'off');
+        xlabel(ax, '频率 (kHz)');
+        ylabel(ax, '功率谱密度 (dB/Hz)');
+        title(ax, sprintf('频谱预览 (%s, Fc=%.2f MHz)', state.mode, fc/1e6));
+        grid(ax, 'on');
+        xlim(ax, [-state.source_fs/2e3, state.source_fs/2e3]);
+        state.spectrum_line = [];
+
+        % 同步更新瀑布图预览
+        ax_wf = state.ax_waterfall;
+        cla(ax_wf);
+        try
+            n_segs = min(200, floor(length(iq_preview) / 4096));
+            spec = zeros(8192, n_segs);
+            win = hann(4096);
+            for i = 1:n_segs
+                si = (i-1) * 4096 + 1;
+                seg = iq_preview(si:min(si+4095, end));
+                if length(seg) < 4096
+                    seg_w = [seg; zeros(4096-length(seg),1)] .* win;
+                else
+                    seg_w = seg .* win;
+                end
+                spec(:, i) = fft(seg_w, 8192);
+            end
+            p_db = fftshift(10*log10(abs(spec).^2 + eps), 1);
+            f_khz = ((0:8191)'/8192 * state.source_fs - state.source_fs/2) / 1e3;
+            imagesc(ax_wf, f_khz, 1:n_segs, p_db');
+            set(ax_wf, 'YDir', 'reverse');
+            try colormap(ax_wf, 'turbo'); catch; end
+            set(ax_wf, 'Color', [0.02 0.02 0.08]);
+            colorbar(ax_wf);
+            xlabel(ax_wf, '频率 (kHz)');
+            title(ax_wf, sprintf('瀑布图预览 (Fc=%.2f MHz)', fc/1e6));
+        catch
+            text(ax_wf, 0.5, 0.5, '瀑布图预览失败', ...
+                'HorizontalAlignment', 'center');
+        end
+        state.waterfall_img = [];
     end
 
     function source_changed_callback()
@@ -389,6 +486,49 @@ function sdr_realtime_processor()
         state.cs_zi = [];
     end
 
+    function play_callback()
+        if ~state.is_demod || isempty(state.audio)
+            uialert(fig, '请先完成处理后再播放', '提示');
+            return;
+        end
+        try
+            clear sound;
+            audio_out = state.audio / max(abs(state.audio)) * 0.9;
+            sound(audio_out, state.audio_fs);
+            state.lbl_status.Text = sprintf('播放中 - 时长 %.1f 秒', ...
+                length(audio_out) / state.audio_fs);
+            state.lbl_status.FontColor = [0 0.6 0];
+        catch ME
+            state.lbl_status.Text = ['播放失败: ', ME.message];
+            state.lbl_status.FontColor = [0.8 0 0];
+        end
+    end
+
+    function export_callback()
+        if ~state.is_demod || isempty(state.audio)
+            uialert(fig, '请先完成处理后再导出', '提示');
+            return;
+        end
+        suggested = sprintf('sdr_%s_%s.wav', ...
+            state.mode, datestr(now, 'yyyymmdd_HHMMSS'));
+        [fname, fpath] = uiputfile({'*.wav', 'WAV音频文件 (*.wav)'}, ...
+            '导出解调音频', suggested);
+        if fname == 0
+            return;
+        end
+        try
+            audio_out = state.audio / max(abs(state.audio));
+            audiowrite(fullfile(fpath, fname), audio_out, state.audio_fs, ...
+                'BitsPerSample', 16, ...
+                'Comment', sprintf('SDR Realtime %s Demodulation', state.mode));
+            state.lbl_status.Text = ['已导出: ', fname];
+            state.lbl_status.FontColor = [0 0.6 0];
+        catch ME
+            state.lbl_status.Text = ['导出失败: ', ME.message];
+            state.lbl_status.FontColor = [0.8 0 0];
+        end
+    end
+
     function start_stop_callback()
         if state.running
             % 停止
@@ -434,6 +574,9 @@ function sdr_realtime_processor()
             state.dd_frame.Enable = 'off';
             state.edit_fs.Editable = 'off';
             state.btn_browse.Enable = 'off';
+            state.btn_play.Enable = 'off';
+            state.btn_export.Enable = 'off';
+            state.is_demod = false;
             % 以下控件可在运行中实时修改:
             %  edit_fc, edit_gain, edit_fo 保持可编辑
 
@@ -595,11 +738,18 @@ function sdr_realtime_processor()
                 end
 
                 % --- Step 4: 音频输出 ---
+                % 累积音频 (用于导出, RTL-SDR限制30秒防止内存爆炸)
+                max_accum = state.audio_fs * 30;
+                if strcmp(state.source_type, 'file') || length(state.audio_accum) < max_accum
+                    state.audio_accum = [state.audio_accum; audio_frame];
+                end
+                % 实时播放: audioDeviceWriter自然调速, 音画同步
                 if state.use_audio_toolbox && ~isempty(state.audio_writer)
+                    % RTL-SDR 实时: 低延迟流式输出
                     n_under = state.audio_writer(audio_frame);
                     state.total_overruns = state.total_overruns + n_under;
                 else
-                    % 回退: 累积~0.3秒再播放, 避免sound()叠加
+                    % RTL-SDR 无AudioToolbox回退: 累积播放
                     state.audio_accum = [state.audio_accum; audio_frame];
                     accum_target = state.audio_fs * 0.3;
                     if length(state.audio_accum) >= accum_target
@@ -639,6 +789,17 @@ function sdr_realtime_processor()
                 state.frame_times(state.ft_idx) = elapsed_ms;
                 state.ft_idx = mod(state.ft_idx, 100) + 1;
 
+                % --- 文件回放调速: 强制等速, 消除卡顿 ---
+                if strcmp(state.source_type, 'file')
+                    t_audio = length(audio_frame) / state.audio_fs;
+                    % 累计音频时长 = 目标时间线
+                    t_target = state.frame_count * t_audio;
+                    t_actual = toc(state.t_start);
+                    if t_actual < t_target
+                        pause(t_target - t_actual);
+                    end
+                end
+
                 % 每~0.5秒更新状态面板
                 if mod(state.frame_count, 18) == 0
                     update_status_panel();
@@ -654,6 +815,14 @@ function sdr_realtime_processor()
                 disp(getReport(ME, 'extended'));
             catch
             end
+        end
+
+        % ===== 保存累积音频供导出 =====
+        if ~isempty(state.audio_accum)
+            state.audio = state.audio_accum;
+            state.is_demod = true;
+            state.btn_play.Enable = 'on';
+            state.btn_export.Enable = 'on';
         end
 
         % ===== 清理 =====
@@ -1040,13 +1209,13 @@ function sdr_realtime_processor()
         state.waterfall_buf(state.waterfall_idx, :) = pxx_db;
         state.waterfall_idx = mod(state.waterfall_idx, state.waterfall_max) + 1;
 
-        % 按显示顺序排列: row 1 = 最新 (顶部)
+        % 按显示顺序排列: row 1 = 最新 (顶部), 向下流动
         if state.waterfall_idx == 1
             ordered = state.waterfall_buf;
         else
             ordered = state.waterfall_buf([state.waterfall_idx:end, 1:state.waterfall_idx-1], :);
         end
-        ordered = flipud(ordered);
+        % 不翻转: row 1(最新)→axes顶部, row end(最旧)→axes底部, 符合瀑布直觉
 
         % 动态颜色范围
         p_valid = pxx_db(isfinite(pxx_db));
@@ -1077,8 +1246,8 @@ function sdr_realtime_processor()
             cb = colorbar(ax);
             cb.Label.String = '功率 (dB)';
             xlabel(ax, '频率 (kHz)');
-            ylabel(ax, '帧序号 (最新在上)');
-            title(ax, '实时瀑布图');
+            ylabel(ax, '帧序号 (新→旧 ↓)');
+            title(ax, '实时瀑布图 (最新在顶部)');
         else
             set(state.waterfall_img, 'CData', ordered);
             caxis(ax, [c_low, c_high]);
