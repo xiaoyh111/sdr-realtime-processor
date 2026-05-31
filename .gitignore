@@ -1,0 +1,7 @@
+# Large WAV audio files (exceed GitHub 100MB limit)
+example_audio/*.wav
+example_audio/**/*.wav
+
+# MATLAB temporary files
+*.asv
+*.m~
