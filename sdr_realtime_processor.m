@@ -66,6 +66,10 @@ function sdr_realtime_processor()
     state.ft_idx           = 1;
     state.total_overruns   = 0;
     state.t_start          = [];
+    % --- 性能日志 (自动记录, 含GUI开销) ---
+    state.perf_log_file    = '';
+    state.perf_log_fid     = -1;  % 保持打开, 避免重复fopen/fclose开销
+    state.perf_last_snap   = -inf;
     % --- GUI句柄 ---
     state.fig              = [];
     state.dd_source        = [];
@@ -625,6 +629,10 @@ function sdr_realtime_processor()
             end
             state.audio_writer = [];
         end
+        if state.perf_log_fid > 0
+            fclose(state.perf_log_fid);
+            state.perf_log_fid = -1;
+        end
         delete(fig);
     end
 
@@ -678,6 +686,26 @@ function sdr_realtime_processor()
         state.ft_idx = 1;
         state.t_start = tic;
         display_update_counter = 0;
+
+        % --- 性能日志初始化 (含GUI开销) ---
+        state.perf_last_snap = -inf;
+        state.perf_log_file = fullfile(fileparts(mfilename('fullpath')), ...
+            'perf-data.csv');
+        % 若文件不存在则创建并写CSV表头
+        if ~isfile(state.perf_log_file)
+            fid_hdr = fopen(state.perf_log_file, 'w');
+            if fid_hdr > 0
+                fprintf(fid_hdr, 'timestamp,frame_size,elapsed_s,frame_count,total_overruns,avg_frame_ms,fps\n');
+                fclose(fid_hdr);
+            end
+        end
+        % 保持文件句柄打开, 避免运行时fopen/fclose开销
+        state.perf_log_fid = fopen(state.perf_log_file, 'a');
+        if state.perf_log_fid > 0
+            fprintf(state.perf_log_fid, '# run %s, fc=%.1fMHz, fs=%.1fMSPS, gain=%ddB, frame_size=%d\n', ...
+                char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm:ss')), ...
+                state.source_fc/1e6, state.source_fs/1e6, state.source_gain, state.frame_size);
+        end
 
         state.lbl_status.Text = '正在处理...';
         state.lbl_status.FontColor = [0 0.6 0];
@@ -809,9 +837,11 @@ function sdr_realtime_processor()
                     end
                 end
 
-                % 每~0.5秒更新状态面板
+                % 每~0.5秒更新状态面板 + 性能快照
                 if mod(state.frame_count, 18) == 0
                     update_status_panel();
+                    % 记录欠载快照 (10s, 20s, 30s, 45s, 60s)
+                    record_perf_snapshot();
                 end
             end
 
@@ -850,6 +880,9 @@ function sdr_realtime_processor()
         else
             state.lbl_status.Text = '已停止';
         end
+
+        % 写入性能日志 (含GUI开销)
+        write_perf_log();
         state.lbl_status.FontColor = [0 0.6 0];
         state.running = false;
     end
@@ -1318,6 +1351,38 @@ function sdr_realtime_processor()
         };
 
         state.lbl_perf.Text = sprintf('%.0f fps | %.1f ms/帧', fps, avg_ms);
+    end
+
+    % --- 性能日志: 每~5秒追加一行原始数据 (无fopen/fclose, 零开销) ---
+    function record_perf_snapshot()
+        if state.perf_log_fid < 0
+            return;
+        end
+        elapsed = toc(state.t_start);
+        if elapsed - state.perf_last_snap < 5
+            return;
+        end
+        state.perf_last_snap = elapsed;
+        avg_ms = mean(state.frame_times(state.frame_times > 0));
+        if isempty(avg_ms) || isnan(avg_ms) || avg_ms == 0
+            fps = 0;
+        else
+            fps = 1000 / avg_ms;
+        end
+        fprintf(state.perf_log_fid, '%s,%d,%.1f,%d,%d,%.1f,%.1f\n', ...
+            char(datetime('now', 'Format', 'yyyy-MM-dd HH:mm:ss')), ...
+            state.frame_size, elapsed, state.frame_count, ...
+            state.total_overruns, avg_ms, fps);
+    end
+
+    % --- 性能日志: 关闭文件 ---
+    function write_perf_log()
+        if state.perf_log_fid > 0
+            fprintf(state.perf_log_fid, '# end of run, total_frames=%d, total_time=%.1fs\n\n', ...
+                state.frame_count, toc(state.t_start));
+            fclose(state.perf_log_fid);
+            state.perf_log_fid = -1;
+        end
     end
 
 end  % sdr_realtime_processor 主函数结束
