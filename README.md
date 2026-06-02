@@ -64,7 +64,7 @@
 
 ## GUI 截图
 
-![GUI 布局](GUI.png)
+![GUI 布局](figures/fm-spectrum-waterfall.png)
 
 ## 性能优化
 
